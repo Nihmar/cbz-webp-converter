@@ -146,6 +146,7 @@ def load_conversion_memory(memory_file):
 
     Note:
         Automatically adds 'skip': false to old memory files for backward compatibility
+        Attempts to restore from most recent backup if main file is corrupted
     """
     if memory_file.exists():
         try:
@@ -159,9 +160,46 @@ def load_conversion_memory(memory_file):
                     if "skip" not in memory[series_name]:
                         memory[series_name]["skip"] = False
                 return memory
-        except (json.JSONDecodeError, IOError):
-            # If file is corrupted or unreadable, start fresh
-            # This prevents the script from crashing on malformed JSON
+        except (json.JSONDecodeError, IOError) as e:
+            # If file is corrupted or unreadable, try to restore from backup
+            console.print(
+                f"[red]⚠ ERROR: Conversion memory file is corrupted![/red]"
+            )
+            console.print(f"[red]Reason: {type(e).__name__}: {e}[/red]")
+            
+            # Try to find and restore from most recent backup
+            backup_dir = memory_file.parent
+            backup_pattern = f"{memory_file.stem}_*{memory_file.suffix}"
+            backups = sorted(
+                backup_dir.glob(backup_pattern),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True
+            )
+            
+            if backups:
+                latest_backup = backups[0]
+                console.print(
+                    f"[yellow]Attempting to restore from backup: {latest_backup.name}[/yellow]"
+                )
+                try:
+                    with open(latest_backup, "r", encoding="utf-8") as f:
+                        memory = json.load(f)
+                        # Ensure backward compatibility
+                        for series_name in memory:
+                            if "skip" not in memory[series_name]:
+                                memory[series_name]["skip"] = False
+                        console.print(
+                            f"[green]Successfully restored conversion memory from backup[/green]"
+                        )
+                        return memory
+                except (json.JSONDecodeError, IOError) as backup_e:
+                    console.print(
+                        f"[red]✗ Failed to restore from backup: {type(backup_e).__name__}: {backup_e}[/red]"
+                    )
+            
+            console.print(
+                f"[yellow]Starting with empty conversion memory (all files will be reprocessed)[/yellow]"
+            )
             return {}
     return {}  # File doesn't exist yet - first run
 
@@ -595,53 +633,54 @@ def process_cbz_file(
         total_new_size = 0  # Track total size after WebP conversion
         converted_count = 0  # Count how many images were actually converted to WebP
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all files to the thread pool for parallel processing
-            # Each file gets processed by a worker thread
-            future_to_filename = {
-                executor.submit(
-                    process_single_file,
-                    filename,
-                    file_data,
-                    quality,
-                    image_progress,
-                    image_task,
-                ): filename
-                for filename, file_data in files_to_process
-            }
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all files to the thread pool for parallel processing
+                # Each file gets processed by a worker thread
+                future_to_filename = {
+                    executor.submit(
+                        process_single_file,
+                        filename,
+                        file_data,
+                        quality,
+                        image_progress,
+                        image_task,
+                    ): filename
+                    for filename, file_data in files_to_process
+                }
 
-            # Collect results as worker threads complete
-            # as_completed returns futures as they finish (not in submission order)
-            for future in as_completed(future_to_filename):
-                filename = future_to_filename[future]
-                try:
-                    # Get result from worker thread
-                    new_filename, converted_data, orig_size, new_size, was_converted = (
-                        future.result()
-                    )
+                # Collect results as worker threads complete
+                # as_completed returns futures as they finish (not in submission order)
+                for future in as_completed(future_to_filename):
+                    filename = future_to_filename[future]
+                    try:
+                        # Get result from worker thread
+                        new_filename, converted_data, orig_size, new_size, was_converted = (
+                            future.result()
+                        )
 
-                    # Store the processed file data
-                    processed_files[filename] = (new_filename, converted_data)
+                        # Store the processed file data
+                        processed_files[filename] = (new_filename, converted_data)
 
-                    # Accumulate statistics
-                    total_orig_size += orig_size
-                    total_new_size += new_size
-                    if was_converted:
-                        converted_count += 1  # Image was successfully converted to WebP
+                        # Accumulate statistics
+                        total_orig_size += orig_size
+                        total_new_size += new_size
+                        if was_converted:
+                            converted_count += 1  # Image was successfully converted to WebP
 
-                except Exception as e:
-                    # Worker thread encountered an error processing this file
-                    # Keep the original file data to avoid data loss
-                    console.print(
-                        f"[yellow]Warning: Error processing {filename}: {type(e).__name__}: {e}[/yellow]"
-                    )
-                    for orig_filename, orig_data in files_to_process:
-                        if orig_filename == filename:
-                            processed_files[filename] = (filename, orig_data)
-                            break
-
-        # Remove the image progress task since all images are done
-        image_progress.remove_task(image_task)
+                    except Exception as e:
+                        # Worker thread encountered an error processing this file
+                        # Keep the original file data to avoid data loss
+                        console.print(
+                            f"[yellow]Warning: Error processing {filename}: {type(e).__name__}: {e}[/yellow]"
+                        )
+                        for orig_filename, orig_data in files_to_process:
+                            if orig_filename == filename:
+                                processed_files[filename] = (filename, orig_data)
+                                break
+        finally:
+            # Always remove the image progress task, even if an error occurs
+            image_progress.remove_task(image_task)
 
         # === PHASE 4: Create new CBZ with processed files ===
         # Write all processed files into a new ZIP archive
@@ -1059,13 +1098,13 @@ def main():
                             names = z.namelist()
                             # Get all image files (including WebP)
                             image_files = [
-                                n for n in names
-                                if Path(n).suffix.lower() in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp"}
+                                name for name in names
+                                if Path(name).suffix.lower() in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp"}
                             ]
                             # Check if all image files are already WebP
                             if image_files and all(
-                                Path(n).suffix.lower() == ".webp"
-                                for n in image_files
+                                Path(name).suffix.lower() == ".webp"
+                                for name in image_files
                             ):
                                 mark_file_converted(
                                     conversion_memory, folder_name, f.name
