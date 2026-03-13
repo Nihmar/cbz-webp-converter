@@ -413,13 +413,26 @@ def convert_image_to_webp(image_data, filename, quality=90):
         # Handle different image color modes for WebP compatibility
         # RGBA = RGB with alpha (transparency) channel - keep as-is for WebP
         # LA = Luminance (grayscale) with alpha - keep as-is for WebP
-        # Other modes need conversion to RGB for optimal WebP encoding
-        if img.mode in ("RGBA", "LA"):
-            # Keep alpha channel - WebP supports transparency
+        # LA with alpha is also supported natively by WebP
+        if img.mode in ("RGBA", "LA", "RGB"):
+            # Keep these modes as-is - WebP supports them natively
             pass
-        elif img.mode != "RGB":
-            # Convert other modes (P=palette, L=grayscale, etc.) to RGB
-            # This ensures consistent WebP encoding
+        elif img.mode == "P":
+            # Palette mode: convert to RGBA if image has transparency, otherwise RGB
+            # WebP supports both, but RGBA preserves transparency information
+            if "transparency" in img.info:
+                img = img.convert("RGBA")
+            else:
+                img = img.convert("RGB")
+        elif img.mode in ("L", "1"):
+            # Grayscale or bitmap: keep as L (WebP supports grayscale)
+            # WebP supports L mode directly, no need to convert to RGB
+            pass
+        elif img.mode == "CMYK":
+            # CMYK is not supported by WebP, convert to RGB
+            img = img.convert("RGB")
+        else:
+            # For any other unsupported modes, convert to RGB as fallback
             img = img.convert("RGB")
 
         # Convert to WebP format in memory (no disk I/O)
@@ -450,6 +463,9 @@ def convert_image_to_webp(image_data, filename, quality=90):
     except Exception as e:
         # Image conversion failed (corrupted image, unsupported format, etc.)
         # Keep original image data to avoid data loss
+        console.print(
+            f"[yellow]Warning: Could not convert {filename}: {type(e).__name__}: {e}[/yellow]"
+        )
         return image_data, filename, len(image_data), len(image_data), False
 
 
@@ -616,6 +632,9 @@ def process_cbz_file(
                 except Exception as e:
                     # Worker thread encountered an error processing this file
                     # Keep the original file data to avoid data loss
+                    console.print(
+                        f"[yellow]Warning: Error processing {filename}: {type(e).__name__}: {e}[/yellow]"
+                    )
                     for orig_filename, orig_data in files_to_process:
                         if orig_filename == filename:
                             processed_files[filename] = (filename, orig_data)
@@ -646,24 +665,72 @@ def process_cbz_file(
         new_cbz_bytes = new_cbz_data.read()
         new_file_size = len(new_cbz_bytes)
 
-        # --- PATCH: mark as processed as soon as new CBZ exists in memory ---
-        mark_file_converted(memory, series_name, cbz_name)
-        save_conversion_memory(memory_file, memory)
-
         # Calculate space savings (negative = saved space, positive = increased size)
         size_diff = new_file_size - original_file_size
 
-        # Handle original file based on --delete flag
-        if delete_original:
-            # Delete mode: overwrite the original file with the new version
-            with open(cbz_path, "wb") as f:
-                f.write(new_cbz_bytes)
-        else:
-            # Backup mode: rename original to *_OLD.cbz, then write new file
-            old_path = cbz_path.with_stem(cbz_path.stem + "_OLD")
-            os.rename(cbz_path, old_path)  # Rename original
-            with open(cbz_path, "wb") as f:
-                f.write(new_cbz_bytes)  # Write new converted file
+        # === PHASE 5: Write new CBZ and handle original ===
+        # IMPORTANT: Write the file FIRST before marking as converted
+        # This ensures memory and file system stay in sync if script crashes
+        try:
+            # Handle original file based on --delete flag
+            if delete_original:
+                # Delete mode: write to temp file first, then atomically replace original
+                # This ensures we don't lose the original if the write fails
+                temp_cbz_path = cbz_path.parent / f"{cbz_path.stem}_temp{cbz_path.suffix}"
+                try:
+                    with open(temp_cbz_path, "wb") as f:
+                        f.write(new_cbz_bytes)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    # Atomic replace: delete original, rename temp to original
+                    # Check if original exists before trying to delete (handles edge cases)
+                    if cbz_path.exists():
+                        cbz_path.unlink()
+                    temp_cbz_path.rename(cbz_path)
+                except Exception:
+                    # Clean up temp file if any step failed
+                    if temp_cbz_path.exists():
+                        temp_cbz_path.unlink()
+                    raise
+            else:
+                # Backup mode: rename original to *_OLD.cbz, then write new file
+                # Python 3.6+ compatible: use parent / (stem + suffix) instead of with_stem()
+                old_path = cbz_path.parent / f"{cbz_path.stem}_OLD{cbz_path.suffix}"
+                # Handle existing _OLD file (from previous failed run)
+                if old_path.exists():
+                    console.print(
+                        f"[yellow]Warning: Removing existing backup {old_path.name}[/yellow]"
+                    )
+                    old_path.unlink()
+                # Write to temp file first
+                temp_cbz_path = cbz_path.parent / f"{cbz_path.stem}_temp{cbz_path.suffix}"
+                # Remove temp file if it exists (from previous failed run)
+                if temp_cbz_path.exists():
+                    temp_cbz_path.unlink()
+                try:
+                    with open(temp_cbz_path, "wb") as f:
+                        f.write(new_cbz_bytes)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    # Rename original to _OLD, then temp to original
+                    # Only rename if original exists
+                    if cbz_path.exists():
+                        os.rename(cbz_path, old_path)
+                    temp_cbz_path.rename(cbz_path)
+                except Exception:
+                    # Clean up temp file if any step failed
+                    if temp_cbz_path.exists():
+                        temp_cbz_path.unlink()
+                    raise
+        except Exception as e:
+            console.print(
+                f"\n[bold red]⚠ ERROR: Failed to write new CBZ file![/bold red]"
+            )
+            console.print(f"[red]Reason: {e}[/red]")
+            console.print(
+                f"[yellow]Keeping original file unchanged. Memory NOT updated.[/yellow]\n"
+            )
+            raise  # Re-raise so the exception handler below catches it
 
         # === PHASE 6: Update statistics and memory ===
         # Update global statistics (thread-safe with lock)
@@ -673,13 +740,10 @@ def process_cbz_file(
                 current_state["stats"]["total_saved"] += abs(size_diff)
             current_state["stats"]["images_converted"] += converted_count
 
-        # Mark this file as converted in memory so we can skip it next time
+        # Mark file as converted AFTER successful file write
+        # This ensures memory only reflects successfully converted files
         mark_file_converted(memory, series_name, cbz_name)
-        # Save memory immediately to disk (prevents data loss if script crashes)
         save_conversion_memory(memory_file, memory)
-
-        # Verbose logging to confirm memory save
-        # (Access args through a global or pass it as parameter - for now just save)
 
         # Update CBZ progress bar
         with progress_lock:
@@ -689,6 +753,9 @@ def process_cbz_file(
 
     except Exception as e:
         # Fatal error processing this CBZ file
+        console.print(
+            f"[red]Error processing {cbz_name}: {type(e).__name__}: {e}[/red]"
+        )
         # Update progress bar and continue to next file
         with progress_lock:
             cbz_progress.update(cbz_task, advance=1)
@@ -920,11 +987,6 @@ def main():
                 layout["stats"].update(create_stats_panel())
                 continue  # Skip to next folder
 
-            # --- PATCH 4: ensure series exists in memory even if all files are skipped ---
-            if folder_name not in conversion_memory:
-                conversion_memory[folder_name] = {"files": [], "skip": False}
-                save_conversion_memory(memory_file, conversion_memory)
-
             # Update TUI to show which folder we're currently processing
             with progress_lock:
                 current_state["folder"] = folder_name
@@ -947,10 +1009,16 @@ def main():
                 with progress_lock:
                     current_state["stats"]["folders_skipped"] += 1
                     folder_progress.update(folder_task, advance=1)
-                    current_state["cbz"] = "Not a directory"
+                    current_state["cbz"] = f"Not a directory: {folder_path}"
                     layout["stats"].update(create_stats_panel())
                     layout["status"].update(create_current_status())
                 continue  # Skip to next folder
+
+            # --- PATCH 4: ensure series exists in memory only if it's a valid directory ---
+            # Use mark_file_converted which handles the lock and creates series if missing
+            with memory_save_lock:
+                if folder_name not in conversion_memory:
+                    conversion_memory[folder_name] = {"files": [], "skip": False}
 
             # Find all CBZ files in this folder
             # CBZ files are comic book archives (just ZIP files with images)
@@ -985,22 +1053,30 @@ def main():
                     if is_file_converted(conversion_memory, folder_name, f.name):
                         continue
 
-                    # PATCH: se il CBZ contiene già solo WebP → consideralo processato
+                    # PATCH: check if CBZ already contains only WebP images (skip if so)
                     try:
                         with ZipFile(f, "r") as z:
                             names = z.namelist()
-                            if names and all(
+                            # Get all image files (including WebP)
+                            image_files = [
+                                n for n in names
+                                if Path(n).suffix.lower() in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp"}
+                            ]
+                            # Check if all image files are already WebP
+                            if image_files and all(
                                 Path(n).suffix.lower() == ".webp"
-                                for n in names
-                                if is_image_file(n)
+                                for n in image_files
                             ):
                                 mark_file_converted(
                                     conversion_memory, folder_name, f.name
                                 )
                                 save_conversion_memory(memory_file, conversion_memory)
                                 continue
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # Log the error so user knows about potentially corrupt CBZ files
+                        console.print(
+                            f"[yellow]Warning: Could not check {f.name}: {type(e).__name__}: {e}[/yellow]"
+                        )
 
                     cbz_files.append(f)
 
